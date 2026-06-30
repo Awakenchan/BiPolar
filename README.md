@@ -1,6 +1,5 @@
 # BiPolar
-Networking module for roblox built with keeping smaller packet size as much as u can for data.
+Networking Module created by @awakenkn, main focus of this module is cutting down on packet size while not mutating data.
 
-For documentation view https://bipolarnetwork.netlify.app
-
+[Documentation](https://bipolarnetwork.netlify.app)
 [Contact](https://awakenkn.netlify.app/)
