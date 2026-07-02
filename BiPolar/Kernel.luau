@@ -4,6 +4,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local EncodingService = game:GetService("EncodingService")
 
 local BitBuffer = require(script.Parent.BitBuffer)
 local Profiler = require(script.Parent.Profiler)
@@ -19,6 +20,18 @@ local TAG_REQUEST = 0
 local TAG_RESPONSE = 1
 local REQUEST_TIMEOUT = 10
 local KEY_SIZE = 256
+
+-- reliable-channel framing: batches at or above COMPRESS_MIN bytes are Zstd
+-- compressed (EncodingService, engine-native) when that actually shrinks them
+-- (lossless; receivers get the identical bytes back). FRAME_RAW/FRAME_ZSTD is
+-- the 1-byte header; the Zstd frame itself carries the decompressed size.
+local COMPRESS_MIN = 64
+local FRAME_RAW = 0
+local FRAME_ZSTD = 1
+local ZSTD = Enum.CompressionAlgorithm.Zstd
+local ZSTD_LEVEL = 3
+-- cap on a decompressed batch from the server, purely a corruption guard
+local MAX_INFLATE = 4194304
 
 export type SecurityConfig = {
 
@@ -82,8 +95,12 @@ local waiters: { thread } = {}
 local masterSeed = 0
 local integrateLate: (Packet) -> ()
 
+-- player is the peer this request was sent to; a response is only accepted
+-- from that same peer (nil on the client, where the peer is the server)
+type PendingRequest = { thread: thread, player: Player?, timeout: thread? }
+
 local nextRequestId = 0
-local pending: { [number]: thread } = {}
+local pending: { [number]: PendingRequest } = {}
 
 local clientOut: Channel = newChannel()
 local serverOut: { [Player]: Channel } = {}
@@ -148,9 +165,13 @@ local function allowPacket(packet: Packet, player: Player?): boolean
 		packetRateByPlayer[player] = byPacket
 	end
 	local slot = byPacket[packet]
-	if not slot or slot.sec ~= now then
-		slot = { sec = now, n = 1 }
-		byPacket[packet] = slot
+	if not slot then
+		byPacket[packet] = { sec = now, n = 1 }
+		return 1 <= limit
+	end
+	if slot.sec ~= now then
+		slot.sec = now
+		slot.n = 1
 		return 1 <= limit
 	end
 	slot.n += 1
@@ -297,27 +318,32 @@ local function buildClientProtocol()
 end
 
 local function ensureReady()
-	if ready then
-		return
+	while not ready do
+		if IS_SERVER then
+			buildServerProtocol()
+			ready = true
+			return
+		end
+		if building then
+			table.insert(waiters, coroutine.running())
+			coroutine.yield()
+			-- re-check: if the builder failed, one of the waiters retries
+			continue
+		end
+		building = true
+		local ok, err = pcall(buildClientProtocol)
+		building = false
+		if ok then
+			ready = true
+		end
+		for _, t in waiters do
+			task.spawn(t)
+		end
+		table.clear(waiters)
+		if not ok then
+			error(err, 0)
+		end
 	end
-	if IS_SERVER then
-		buildServerProtocol()
-		ready = true
-		return
-	end
-	if building then
-		table.insert(waiters, coroutine.running())
-		coroutine.yield()
-		return
-	end
-	building = true
-	buildClientProtocol()
-	ready = true
-	building = false
-	for _, t in waiters do
-		task.spawn(t)
-	end
-	table.clear(waiters)
 end
 
 local function getClientWriter(reliable: boolean): BitBuffer.Writer
@@ -328,7 +354,12 @@ local function getServerWriter(player: Player, reliable: boolean): BitBuffer.Wri
 	local bucket = serverOut[player]
 	if not bucket then
 		bucket = newChannel()
-		serverOut[player] = bucket
+		-- a player that already left gets a throwaway channel: the write is
+		-- silently dropped instead of resurrecting an entry PlayerRemoving
+		-- already cleaned up
+		if player.Parent ~= nil then
+			serverOut[player] = bucket
+		end
 	end
 	return if reliable then bucket.reliable else bucket.unreliable
 end
@@ -547,12 +578,14 @@ local function invoke(packet: Packet, writer: BitBuffer.Writer, requestValue: an
 	Profiler.record(packet.name, "out", writer.cursor - before, 1)
 	logMessage(packet, "out", "request", requestValue, writer.buf, before, writer.cursor, player)
 
-	pending[id] = coroutine.running()
-	task.delay(REQUEST_TIMEOUT, function()
-		local co = pending[id]
-		if co then
+	local entry: PendingRequest = { thread = coroutine.running(), player = player, timeout = nil }
+	pending[id] = entry
+	entry.timeout = task.delay(REQUEST_TIMEOUT, function()
+		if pending[id] == entry then
 			pending[id] = nil
-			task.spawn(co, nil, true)
+			if coroutine.status(entry.thread) == "suspended" then
+				task.spawn(entry.thread, nil, true)
+			end
 		end
 	end)
 
@@ -690,10 +723,15 @@ local function dispatch(reader: BitBuffer.Reader, player: Player?)
 				end
 				Profiler.record(packet.name, "in", reader.cursor - start, 1)
 				logMessage(packet, "in", "response", resp, reader.buf, start, reader.cursor, player)
-				local co = pending[id]
-				if co then
+				local entry = pending[id]
+				if entry and entry.player == player then
 					pending[id] = nil
-					task.spawn(co, resp)
+					if entry.timeout then
+						task.cancel(entry.timeout)
+					end
+					if coroutine.status(entry.thread) == "suspended" then
+						task.spawn(entry.thread, resp)
+					end
 				end
 			end
 		else
@@ -732,15 +770,66 @@ local function dispatch(reader: BitBuffer.Reader, player: Player?)
 	end
 end
 
+-- unreliable channel: scramble only, wire bytes unchanged (movement traffic
+-- is tiny and per-frame; a frame header would only add overhead)
 local function emit(buf: buffer): buffer
 	scramble(buf)
 	return buf
 end
 
+-- reliable channel: [flag u8][payload], compressed when it genuinely shrinks
+local function emitFramed(buf: buffer): buffer
+	local rawLen = buffer.len(buf)
+	if rawLen >= COMPRESS_MIN then
+		local ok, packed = pcall(EncodingService.CompressBuffer, EncodingService, buf, ZSTD, ZSTD_LEVEL)
+		if ok and buffer.len(packed) < rawLen then
+			local out = buffer.create(buffer.len(packed) + 1)
+			buffer.writeu8(out, 0, FRAME_ZSTD)
+			buffer.copy(out, 1, packed, 0)
+			scramble(out)
+			return out
+		end
+	end
+	local out = buffer.create(rawLen + 1)
+	buffer.writeu8(out, 0, FRAME_RAW)
+	buffer.copy(out, 1, buf, 0)
+	scramble(out)
+	return out
+end
+
+-- inverse of the framing; b is already unscrambled. nil = corrupt, drop it.
+local function openFramed(b: buffer, sizeCap: number): BitBuffer.Reader?
+	local len = buffer.len(b)
+	if len < 1 then
+		return nil
+	end
+	local flag = buffer.readu8(b, 0)
+	if flag == FRAME_RAW then
+		local reader = BitBuffer.Reader.new(b)
+		reader.cursor = 1
+		return reader
+	end
+	if flag ~= FRAME_ZSTD or len < 2 then
+		return nil
+	end
+	local body = buffer.create(len - 1)
+	buffer.copy(body, 0, b, 1)
+	-- the recommended untrusted-input pre-check: nil on corrupt/absent size
+	local size = EncodingService:GetDecompressedBufferSize(body, ZSTD)
+	if size == nil or size > sizeCap then
+		return nil
+	end
+	local ok, out = pcall(EncodingService.DecompressBuffer, EncodingService, body, ZSTD)
+	if not ok then
+		return nil
+	end
+	return BitBuffer.Reader.new(out)
+end
+
 local function flushClient()
 	local rw = clientOut.reliable
 	if rw.cursor > 0 then
-		reliableRemote:FireServer(emit(rw:result()))
+		reliableRemote:FireServer(emitFramed(rw:result()))
 		rw:reset()
 	end
 	local uw = clientOut.unreliable
@@ -752,15 +841,21 @@ end
 
 local function flushServer()
 	for player, bucket in serverOut do
+		if player.Parent == nil then
+			serverOut[player] = nil
+			continue
+		end
 		local rw = bucket.reliable
 		if rw.cursor > 0 then
-			reliableRemote:FireClient(player, emit(rw:result()))
+			local out = emitFramed(rw:result())
 			rw:reset()
+			pcall(reliableRemote.FireClient, reliableRemote, player, out)
 		end
 		local uw = bucket.unreliable
 		if uw.cursor > 0 then
-			unreliableRemote:FireClient(player, emit(uw:result()))
+			local out = emit(uw:result())
 			uw:reset()
+			pcall(unreliableRemote.FireClient, unreliableRemote, player, out)
 		end
 	end
 end
@@ -852,7 +947,7 @@ local function allowInbound(player: Player, size: number): boolean
 	return true
 end
 
-local function onServerReceive(player: Player, b: any)
+local function onServerReceive(player: Player, b: any, framed: boolean)
 	if typeof(b) ~= "buffer" then
 		return
 	end
@@ -861,23 +956,45 @@ local function onServerReceive(player: Player, b: any)
 	end
 	ensureReady()
 	scramble(b)
-	dispatch(BitBuffer.Reader.new(b), player)
+	if framed then
+		local reader = openFramed(b, security.maxBufferBytes)
+		if not reader then
+			warn(`BiPolar: dropped corrupt reliable batch from {player.Name}`)
+			return
+		end
+		dispatch(reader, player)
+	else
+		dispatch(BitBuffer.Reader.new(b), player)
+	end
 end
 
-local function onClientReceive(b: any)
+local function onClientReceive(b: any, framed: boolean)
 	if typeof(b) ~= "buffer" then
 		return
 	end
 	ensureReady()
 	scramble(b)
-	dispatch(BitBuffer.Reader.new(b), nil)
+	if framed then
+		local reader = openFramed(b, MAX_INFLATE)
+		if not reader then
+			warn("BiPolar: dropped corrupt reliable batch from the server")
+			return
+		end
+		dispatch(reader, nil)
+	else
+		dispatch(BitBuffer.Reader.new(b), nil)
+	end
 end
 
 local function init()
 	setupRemotes()
 	if IS_SERVER then
-		reliableRemote.OnServerEvent:Connect(onServerReceive)
-		unreliableRemote.OnServerEvent:Connect(onServerReceive)
+		reliableRemote.OnServerEvent:Connect(function(player: Player, b: any)
+			onServerReceive(player, b, true)
+		end)
+		unreliableRemote.OnServerEvent:Connect(function(player: Player, b: any)
+			onServerReceive(player, b, false)
+		end)
 		Players.PlayerRemoving:Connect(function(player: Player)
 			serverOut[player] = nil
 			rateByPlayer[player] = nil
@@ -887,8 +1004,12 @@ local function init()
 
 		task.defer(ensureReady)
 	else
-		reliableRemote.OnClientEvent:Connect(onClientReceive)
-		unreliableRemote.OnClientEvent:Connect(onClientReceive)
+		reliableRemote.OnClientEvent:Connect(function(b: any)
+			onClientReceive(b, true)
+		end)
+		unreliableRemote.OnClientEvent:Connect(function(b: any)
+			onClientReceive(b, false)
+		end)
 		RunService.Heartbeat:Connect(flushClient)
 	end
 end
