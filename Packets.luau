@@ -39,8 +39,4 @@ Packets.Replicate = Bipolar.defineFunction("Replicate", t.u8, {
 	playerCount = t.u8,
 }, { direction = Direction.ClientToServer, rateLimit = 10 })
 
-Packets.Verify = Bipolar.defineFunction("Verify", t.u32, {
-	token = t.u32,
-}, { direction = Direction.ServerToClient })
-
 return Packets
