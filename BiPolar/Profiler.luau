@@ -131,15 +131,6 @@ function Profiler.clearLog()
 	table.clear(log)
 end
 
-function Profiler.reset()
-	table.clear(stats)
-	table.clear(lastStats)
-	table.clear(rates)
-	table.clear(log)
-	table.clear(frames)
-	table.clear(frameLast)
-end
-
 local accumulated = 0
 RunService.Heartbeat:Connect(function(dt: number)
 	accumulated += dt
@@ -178,6 +169,15 @@ local frames: { FrameSample } = {}
 local frameLast: { [string]: { out: number, inb: number } } = {}
 local frameListeners: { () -> () } = {}
 local paused = false
+
+function Profiler.reset()
+	table.clear(stats)
+	table.clear(lastStats)
+	table.clear(rates)
+	table.clear(log)
+	table.clear(frames)
+	table.clear(frameLast)
+end
 
 function Profiler.setPaused(value: boolean)
 	paused = value
