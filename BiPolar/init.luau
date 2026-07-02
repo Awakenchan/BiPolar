@@ -29,6 +29,10 @@
 	  - Request/response (:Invoke / :OnInvoke) is emulated over the reliable event
 	    with request ids, so it batches with everything else — there is no
 	    unbatched RemoteFunction path.
+	  - Reliable batches of 64+ bytes are Zstd-compressed (engine-native
+	    EncodingService) when that genuinely shrinks them — fully lossless, the
+	    receiver decodes the identical bytes. Unreliable batches are sent as-is
+	    (they're tiny and per-frame; a header would only add overhead).
 	  - Two layers of inbound protection: the adaptive FLOOD GUARD (global, per
 	    player; learns each player's normal traffic) and the per-packet RATE LIMIT
 	    / server-side lock (config.rateLimit). Plus direction enforcement.
