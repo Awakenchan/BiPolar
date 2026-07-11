@@ -83,11 +83,11 @@ project at `src/shared/BiPolar` (this is what the demo does). Just make sure the
 `BiPolar` folder ends up somewhere both the client and server can `require` it,
 e.g. `ReplicatedStorage`.
 
-**Without Rojo** — grab `BiPolar.rbxm` from the
+**Without Rojo** — grab `BiPolarNetwork.rbxm` from the
 [latest release](../../releases/latest) and drag it into
 Studio (or right-click a service → *Insert from File*). Drop it in
-`ReplicatedStorage` and `require` it — no toolchain, no build step. To reproduce
-the model yourself: `rojo build model.project.json -o BiPolar.rbxm`.
+`ReplicatedStorage` and `require` it — no toolchain, no build step. To rebuild the
+model yourself from source: `rojo build model.project.json -o BiPolar.rbxm`.
 
 Either way you get the same `BiPolar` ModuleScript; the rest of this README is
 identical.
