@@ -9,5 +9,8 @@
 
 sourcemap.json
 
-# Local Claude Code settings (per-user)
-/.claude/settings.local.json
+# Local / dev-only, not shipped in the public repo
+/.claude/
+/tests/
+/tools/
+/web/
