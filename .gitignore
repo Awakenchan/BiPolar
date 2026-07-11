@@ -1,0 +1,13 @@
+# Build artifacts (attached to GitHub releases, not committed)
+/BipolarNetworking.rbxlx
+/BiPolar.rbxm
+/BiPolar.rbxmx
+
+# Roblox Studio lock files
+/*.rbxlx.lock
+/*.rbxl.lock
+
+sourcemap.json
+
+# Local Claude Code settings (per-user)
+/.claude/settings.local.json
