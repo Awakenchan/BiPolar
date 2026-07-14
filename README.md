@@ -412,17 +412,9 @@ tests/core.test.luau      -- Lune test for the serializer core
 web/index.html            -- interactive bandwidth simulator (open in a browser)
 ```
 
-## Interactive web example
+## Web Doc
 
-[`web/index.html`](web/index.html) is a self-contained page (no build step, no
-dependencies) that encodes a movement packet with the **same byte model the
-library uses** and graphs its bandwidth against a naive RemoteEvent table — turn
-the send rate, player count, position precision and fields and watch sent / recv
-move. It's the visual companion to the F3 profiler.
-
-```bash
-python -m http.server 8777 --directory web   # then open http://localhost:8777
-```
+[WebDoc](https://bipolarnetwork.netlify.app)
 
 ## Building & dev tools
 
